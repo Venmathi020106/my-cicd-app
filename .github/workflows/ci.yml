@@ -1,0 +1,21 @@
+name: Python CI Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-node@v4  # Runs Python on GitHub's cloud server
+      with:
+        python-version: '3.10'
+
+    - name: Run app test
+      run: python app.py
