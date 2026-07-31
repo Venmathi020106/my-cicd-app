@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 from google import genai
 from groq import Groq
 
-# Load local environment variables from .env
 load_dotenv()
 
 def main():
@@ -13,7 +12,7 @@ def main():
     print("\n--- Requesting Gemini ---")
     gemini_client = genai.Client()
     gemini_response = gemini_client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="models/gemini-2.0-flash",  # <--- Added 'models/' prefix with 2.0-flash
         contents="Give me a 1-sentence motivation quote for a live demo."
     )
     print("Gemini Response:", gemini_response.text)
