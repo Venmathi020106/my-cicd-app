@@ -13,7 +13,7 @@ def main():
     print("\n--- Requesting Gemini ---")
     gemini_client = genai.Client()
     gemini_response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",  # <--- Updated model name here
         contents="Give me a 1-sentence motivation quote for a live demo."
     )
     print("Gemini Response:", gemini_response.text)
