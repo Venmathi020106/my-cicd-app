@@ -8,7 +8,7 @@ def main():
     print("Application started successfully!")
     
     # Initialize the Gemini client
-    client = genai.Client()
+    client = genai.client()
     
     # Generate content using Gemini
     response = client.models.generate_content(
