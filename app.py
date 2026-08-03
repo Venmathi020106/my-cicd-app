@@ -1,47 +1,70 @@
 import os
+import time
+import logging
 from dotenv import load_dotenv
-from google import genai
-from google.genai.errors import ClientError
+import google.generativeai as genai
 from groq import Groq
 
+# Load environment variables
 load_dotenv()
 
-def main():
-    print("Application started successfully!")
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    # 1. DEFINE YOUR PROMPT HERE
-    user_prompt = "Give me a 1-sentence motivation quote for a live demo."
+# Setup API Clients
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    # 2. Try Gemini First
-    print("\n--- Requesting Gemini ---")
+def generate_completion(prompt: str):
+    start_time = time.time()
+    
+    # Feature 1: Structured Logs - Attempting Primary
+    logging.info("🟢 [PRIMARY] Attempting request with Gemini 2.0 Flash...")
+    
     try:
-        gemini_client = genai.Client()
-        gemini_response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=user_prompt  # <--- Using prompt here
-        )
-        print("Gemini Response:", gemini_response.text)
-        return  # Stop execution if Gemini succeeds!
+        # Primary Provider: Gemini
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+        
+        latency = round(time.time() - start_time, 2)
+        
+        # Feature 2: Provider Metrics
+        print("\n" + "="*40)
+        print(f"✅ SUCCESS | Provider: Gemini 2.0 Flash | Latency: {latency}s")
+        print("="*40)
+        return response.text
 
-    except ClientError as e:
-        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            print("Gemini API rate limit reached (429). Falling back to Groq...")
-        else:
-            raise e
+    except Exception as e:
+        # Catch 429 Rate Limits or General Failures
+        error_msg = str(e)
+        logging.warning(f"🟡 [FAILOVER TRIGGERED] Primary provider failed. Error: {error_msg}")
+        logging.info("🔴 [SECONDARY] Switching to Groq (Llama 3.3 70B)...")
+        
+        fallback_start = time.time()
+        
+        try:
+            # Fallback Provider: Groq
+            chat_completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+            )
+            
+            total_latency = round(time.time() - start_time, 2)
+            fallback_latency = round(time.time() - fallback_start, 2)
+            
+            # Feature 2: Provider Metrics
+            print("\n" + "="*40)
+            print(f"✅ SUCCESS | Provider: Groq (Llama 3.3 70B)")
+            print(f"⏱️  Fallback Latency: {fallback_latency}s | Total Latency: {total_latency}s")
+            print("="*40)
+            
+            return chat_completion.choices[0].message.content
 
-    # 3. Fallback to Groq ONLY if Gemini fails
-    print("\n--- Requesting Groq (Fallback) ---")
-    groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-    groq_response = groq_client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": user_prompt,  # <--- Using the SAME prompt here
-            }
-        ],
-        model="llama-3.3-70b-versatile",
-    )
-    print("Groq Response:", groq_response.choices[0].message.content)
+        except Exception as groq_error:
+            logging.error(f"❌ [CRITICAL] Both primary and fallback providers failed: {groq_error}")
+            raise groq_error
 
 if __name__ == "__main__":
-    main()
+    test_prompt = "Explain quantum computing in two sentences."
+    result = generate_completion(test_prompt)
+    print(f"\nResponse Output:\n{result}")
