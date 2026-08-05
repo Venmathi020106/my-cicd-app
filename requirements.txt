@@ -1,1 +1,5 @@
-fastapiuvicorn[standard]redisgroqpydanticpython-dotenvhttpxrequests
+fastapi
+uvicorn
+redis
+pydantic
+groq
