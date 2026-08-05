@@ -1,70 +1,117 @@
 import os
 import time
-import logging
-from dotenv import load_dotenv
-import google.generativeai as genai
-from groq import Groq
+import requests
+import redis
+from fastapi import FastAPI, HTTPException, Query
 
-# Load environment variables
-load_dotenv()
+app = FastAPI(title="Multi-LLM Orchestration Platform")
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+START_TIME = time.time()
 
-# Setup API Clients
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 
-def generate_completion(prompt: str):
-    start_time = time.time()
-    
-    # Feature 1: Structured Logs - Attempting Primary
-    logging.info("🟢 [PRIMARY] Attempting request with Gemini 2.0 Flash...")
-    
-    try:
-        # Primary Provider: Gemini
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content(prompt)
-        
-        latency = round(time.time() - start_time, 2)
-        
-        # Feature 2: Provider Metrics
-        print("\n" + "="*40)
-        print(f"✅ SUCCESS | Provider: Gemini 2.0 Flash | Latency: {latency}s")
-        print("="*40)
-        return response.text
+try:
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, socket_timeout=2)
+except Exception:
+    redis_client = None
 
-    except Exception as e:
-        # Catch 429 Rate Limits or General Failures
-        error_msg = str(e)
-        logging.warning(f"🟡 [FAILOVER TRIGGERED] Primary provider failed. Error: {error_msg}")
-        logging.info("🔴 [SECONDARY] Switching to Groq (Llama 3.3 70B)...")
-        
-        fallback_start = time.time()
-        
+@app.get("/")
+def read_root():
+    return {"message": "Multi-LLM Orchestration Platform API"}
+
+@app.get("/metrics")
+def get_metrics():
+    redis_status = "disconnected"
+    if redis_client:
         try:
-            # Fallback Provider: Groq
-            chat_completion = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
+            if redis_client.ping():
+                redis_status = "connected"
+        except Exception:
+            redis_status = "error"
+
+    uptime_seconds = int(time.time() - START_TIME)
+
+    return {
+        "status": "healthy",
+        "uptime_seconds": uptime_seconds,
+        "services": {
+            "redis": redis_status,
+            "primary_llm": "Hugging Face",
+            "fallback_llm": "Groq"
+        }
+    }
+
+@app.post("/generate")
+def generate_text(prompt: str = Query(..., description="Prompt text to send to LLM")):
+    errors = {}
+
+    if HF_API_TOKEN:
+        try:
+            headers = {
+                "Authorization": f"Bearer {HF_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "inputs": prompt,
+                "parameters": {"max_new_tokens": 100}
+            }
+            hf_res = requests.post(
+                "https://api-inference.huggingface.co/models/gpt2",
+                headers=headers,
+                json=payload,
+                timeout=8
             )
-            
-            total_latency = round(time.time() - start_time, 2)
-            fallback_latency = round(time.time() - fallback_start, 2)
-            
-            # Feature 2: Provider Metrics
-            print("\n" + "="*40)
-            print(f"✅ SUCCESS | Provider: Groq (Llama 3.3 70B)")
-            print(f"⏱️  Fallback Latency: {fallback_latency}s | Total Latency: {total_latency}s")
-            print("="*40)
-            
-            return chat_completion.choices[0].message.content
+            if hf_res.status_code == 200:
+                return {
+                    "status": "success",
+                    "provider": "Hugging Face",
+                    "model": "gpt2",
+                    "response": hf_res.json()
+                }
+            else:
+                errors["huggingface"] = f"HTTP {hf_res.status_code}: {hf_res.text}"
+        except Exception as e:
+            errors["huggingface"] = str(e)
+    else:
+        errors["huggingface"] = "HF_API_TOKEN not found in environment"
 
-        except Exception as groq_error:
-            logging.error(f"❌ [CRITICAL] Both primary and fallback providers failed: {groq_error}")
-            raise groq_error
+    if GROQ_API_KEY:
+        try:
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "messages": [{"role": "user", "content": prompt}],
+                "model": "llama-3.1-8b-instant"
+            }
+            groq_res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=10
+            )
+            if groq_res.status_code == 200:
+                return {
+                    "status": "success",
+                    "provider": "Groq",
+                    "model": "llama-3.1-8b-instant",
+                    "response": groq_res.json()
+                }
+            else:
+                errors["groq"] = f"HTTP {groq_res.status_code}: {groq_res.text}"
+        except Exception as e:
+            errors["groq"] = str(e)
+    else:
+        errors["groq"] = "GROQ_API_KEY not found in environment"
 
-if __name__ == "__main__":
-    test_prompt = "Explain quantum computing in two sentences."
-    result = generate_completion(test_prompt)
-    print(f"\nResponse Output:\n{result}")
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "All LLM providers failed to execute request",
+            "diagnostics": errors
+        }
+    )
