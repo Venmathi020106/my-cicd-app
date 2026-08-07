@@ -3,3 +3,5 @@ uvicorn
 redis
 pydantic
 groq
+streamlit
+requests

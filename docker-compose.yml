@@ -9,8 +9,19 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - INTERNAL_API_KEY=secret-internal-key-123
     depends_on:
       - redis
+
+  ui:
+    build: .
+    command: streamlit run streamlit_app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    environment:
+      - INTERNAL_API_KEY=secret-internal-key-123
+    depends_on:
+      - web
 
   redis:
     image: redis:alpine
