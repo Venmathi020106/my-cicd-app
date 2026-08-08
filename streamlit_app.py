@@ -13,7 +13,7 @@ selected_model = st.selectbox("Select Model:", ["llama-3.3-70b-versatile"])
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# 2. Render all past prompt/response pairs in sequential order
+# 2. Render past messages
 chat_container = st.container()
 with chat_container:
     for message in st.session_state.messages:
@@ -22,21 +22,26 @@ with chat_container:
             if "source" in message:
                 st.caption(f"⚡ Served via: `{message['source']}`")
 
-# 3. Handle new prompt input at the bottom
+# 3. Handle user input
 if prompt := st.chat_input("Ask anything..."):
-    # Append user prompt and render immediately
+    # Append user prompt
     st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container:
         with st.chat_message("user"):
             st.write(prompt)
 
-    # Call FastAPI backend
+    # Format full message history payload for backend
+    api_messages = [
+        {"role": msg["role"], "content": msg["content"]} 
+        for msg in st.session_state.messages
+    ]
+
     url = "http://web:8000/generate"
     headers = {
         "X-API-Key": "secret-internal-key-123",
         "Content-Type": "application/json"
     }
-    payload = {"prompt": prompt}
+    payload = {"messages": api_messages}
 
     with chat_container:
         with st.chat_message("assistant"):
@@ -50,7 +55,7 @@ if prompt := st.chat_input("Ask anything..."):
                     st.write(text)
                     st.caption(f"⚡ Served via: `{source}`")
                     
-                    # Store response so it stays on next rerun
+                    # Save assistant response to context
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": text,

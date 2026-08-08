@@ -3,7 +3,7 @@ import re
 import time
 import hashlib
 import logging
-from typing import Optional
+from typing import Optional, List, Dict
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from pydantic import BaseModel
@@ -20,8 +20,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 app = FastAPI(
     title="Enterprise AI Gateway & Governance Platform",
-    description="Production API Gateway with PII Guardrails, FAQ Pre-Caching, Redis Caching & Failover Orchestration.",
-    version="1.2.0"
+    description="Production API Gateway with PII Guardrails, Multi-turn Chat Context, Redis Caching & Failover Orchestration.",
+    version="1.3.0"
 )
 
 # Environment Variables
@@ -42,8 +42,13 @@ except Exception as e:
     logging.warning(f"Redis connection failed: {e}. Operating without cache/rate limiting.")
     redis_client = None
 
+# Pydantic Schemas for Multi-turn History
+class MessageItem(BaseModel):
+    role: str
+    content: str
+
 class PromptRequest(BaseModel):
-    prompt: str
+    messages: List[MessageItem]
 
 # ------------------------------------------------------------------------------
 # 2. PII Guardrail & Security Helpers
@@ -93,17 +98,17 @@ def enforce_rate_limit(api_key: str, max_requests: int = 10, window_seconds: int
 # ------------------------------------------------------------------------------
 # 3. Execution Engines (Primary & Secondary Fallback)
 # ------------------------------------------------------------------------------
-def call_groq_primary(prompt: str) -> str:
-    """Primary LLM provider: Groq (Llama 3.3 70B)."""
+def call_groq_primary(messages: List[Dict[str, str]]) -> str:
+    """Primary LLM provider: Groq (Llama 3.3 70B) with full chat history."""
     if not groq_client:
         raise Exception("Groq client not initialized or invalid API key.")
     completion = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         model="llama-3.3-70b-versatile"
     )
     return completion.choices[0].message.content
 
-def call_huggingface_fallback(prompt: str) -> str:
+def call_huggingface_fallback(messages: List[Dict[str, str]]) -> str:
     """Secondary LLM provider fallback: Hugging Face Router API (Llama 3.2 1B)."""
     if not HF_TOKEN:
         raise Exception("Hugging Face API token (HF_TOKEN) is missing.")
@@ -115,7 +120,7 @@ def call_huggingface_fallback(prompt: str) -> str:
     }
     payload = {
         "model": "meta-llama/Llama-3.2-1B-Instruct",
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": 256
     }
     
@@ -140,10 +145,21 @@ async def generate_response(
 ):
     enforce_rate_limit(api_key)
 
-    original_prompt = payload.prompt
-    clean_prompt, pii_found = sanitize_prompt(original_prompt)
+    # Sanitize each message in the context history
+    formatted_messages = []
+    pii_found = False
+    for msg in payload.messages:
+        if msg.role == "user":
+            clean_content, pii_detected = sanitize_prompt(msg.content)
+            if pii_detected:
+                pii_found = True
+            formatted_messages.append({"role": "user", "content": clean_content})
+        else:
+            formatted_messages.append({"role": msg.role, "content": msg.content})
 
-    prompt_hash = hashlib.sha256(clean_prompt.strip().lower().encode("utf-8")).hexdigest()
+    # Cache key generated based on full context sequence
+    context_str = "".join([f"{m['role']}:{m['content']}" for m in formatted_messages])
+    prompt_hash = hashlib.sha256(context_str.strip().lower().encode("utf-8")).hexdigest()
     cache_key = f"cache:{prompt_hash}"
 
     # Check Cache First
@@ -162,12 +178,12 @@ async def generate_response(
     # Primary Attempt with Automatic Fallback Rerouting
     logging.info("Attempting primary model (Groq)...")
     try:
-        response_text = call_groq_primary(clean_prompt)
+        response_text = call_groq_primary(formatted_messages)
         source = "primary_groq"
     except Exception as primary_error:
         logging.warning(f"Primary Groq failed: {primary_error}. Rerouting to Hugging Face fallback...")
         try:
-            response_text = call_huggingface_fallback(clean_prompt)
+            response_text = call_huggingface_fallback(formatted_messages)
             source = "fallback_huggingface"
         except Exception as fallback_error:
             logging.error(f"Fallback failed: {fallback_error}")
@@ -176,7 +192,7 @@ async def generate_response(
                 detail=f"Bad Gateway: Primary and Fallback providers failed. Details: {fallback_error}"
             )
 
-    # Store in Cache only if non-empty
+    # Store in Cache only if response is non-empty
     if redis_client and response_text and response_text.strip():
         try:
             redis_client.setex(cache_key, 3600, response_text)
