@@ -9,15 +9,27 @@ st.caption("Powered by FastAPI, Groq & Redis Caching (Secured with API Key)")
 # Model Selector
 selected_model = st.selectbox("Select Model:", ["llama-3.3-70b-versatile"])
 
-# Chat Input
+# Initialize Chat History in Session State
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display previous chat messages from history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+        if "source" in message:
+            st.caption(f"⚡ Served via: `{message['source']}`")
+
+# Accept new user prompt
 prompt = st.chat_input("Ask anything...")
 
 if prompt:
-    # Display user prompt
+    # 1. Append & render user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # API Request configuration
+    # 2. Call FastAPI backend
     url = "http://web:8000/generate"
     headers = {
         "X-API-Key": "secret-internal-key-123",
@@ -30,15 +42,19 @@ if prompt:
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             if response.status_code == 200:
                 data = response.json()
-                # Correct key extraction from FastAPI payload
                 text = data.get("response", "No response received.")
                 source = data.get("source", "unknown")
                 
-                # Display LLM text output
+                # Render response
                 st.write(text)
-                
-                # Display metadata tag
                 st.caption(f"⚡ Served via: `{source}`")
+                
+                # Append assistant message to history
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": text, 
+                    "source": source
+                })
             else:
                 st.error(f"API Error: {response.status_code} - {response.text}")
         except Exception as e:
