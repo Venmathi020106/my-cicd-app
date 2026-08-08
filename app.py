@@ -12,7 +12,7 @@ import requests
 from groq import Groq
 
 # ------------------------------------------------------------------------------
-# 1. Configuration & Setup
+# 1. Configuration & Application Setup
 # ------------------------------------------------------------------------------
 load_dotenv()
 
@@ -24,12 +24,14 @@ app = FastAPI(
     version="1.2.0"
 )
 
+# Environment Variables
 X_API_KEY = os.getenv("X_API_KEY", "secret-internal-key-123")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
+# Client Initialization
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and GROQ_API_KEY != "gsk_INVALID_KEY_FOR_TESTING" else None
 
 try:
@@ -44,9 +46,10 @@ class PromptRequest(BaseModel):
     prompt: str
 
 # ------------------------------------------------------------------------------
-# 2. PII Guardrail & Security
+# 2. PII Guardrail & Security Helpers
 # ------------------------------------------------------------------------------
 def sanitize_prompt(prompt: str) -> tuple[str, bool]:
+    """Scans and redacts sensitive data (emails, phones, cards, keys) from prompts."""
     pii_patterns = {
         "EMAIL": r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
         "PHONE": r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
@@ -64,11 +67,13 @@ def sanitize_prompt(prompt: str) -> tuple[str, bool]:
     return cleaned_prompt, pii_detected
 
 def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    """Validates header authorization key."""
     if not x_api_key or x_api_key != X_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid or missing X-API-Key header.")
     return x_api_key
 
 def enforce_rate_limit(api_key: str, max_requests: int = 10, window_seconds: int = 60):
+    """Enforces sliding window rate limits using Redis."""
     if not redis_client:
         return
     rate_key = f"rate_limit:{api_key}"
@@ -86,12 +91,12 @@ def enforce_rate_limit(api_key: str, max_requests: int = 10, window_seconds: int
         logging.error(f"Redis rate limiting error: {e}")
 
 # ------------------------------------------------------------------------------
-# 3. Execution Engines (Real API Calls)
+# 3. Execution Engines (Primary & Secondary Fallback)
 # ------------------------------------------------------------------------------
 def call_groq_primary(prompt: str) -> str:
-    """Calls primary model: Groq (Llama 3.3 70B)."""
+    """Primary LLM provider: Groq (Llama 3.3 70B)."""
     if not groq_client:
-        raise Exception("Groq client not initialized or invalid key provided.")
+        raise Exception("Groq client not initialized or invalid API key.")
     completion = groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
         model="llama-3.3-70b-versatile"
@@ -99,15 +104,19 @@ def call_groq_primary(prompt: str) -> str:
     return completion.choices[0].message.content
 
 def call_huggingface_fallback(prompt: str) -> str:
-    """Calls live secondary model fallback on Hugging Face Serverless API."""
+    """Secondary LLM provider fallback: Hugging Face Router API (Qwen 2.5 Coder)."""
     if not HF_TOKEN:
         raise Exception("Hugging Face API token (HF_TOKEN) is missing.")
     
-    url = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-Coder-32B-Instruct"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    url = "https://router.huggingface.co/hf-inference/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "inputs": f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-        "parameters": {"max_new_tokens": 256, "temperature": 0.7}
+        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 256
     }
     
     response = requests.post(url, headers=headers, json=payload, timeout=20)
@@ -115,13 +124,15 @@ def call_huggingface_fallback(prompt: str) -> str:
         raise Exception(f"Hugging Face API Error ({response.status_code}): {response.text}")
     
     res_data = response.json()
-    if isinstance(res_data, list) and "generated_text" in res_data[0]:
-        return res_data[0]["generated_text"].split("<|im_start|>assistant\n")[-1].strip()
-    return str(res_data)
+    return res_data["choices"][0]["message"]["content"]
 
 # ------------------------------------------------------------------------------
 # 4. REST Endpoints
 # ------------------------------------------------------------------------------
+@app.get("/")
+def read_root():
+    return {"status": "online", "service": "Enterprise AI Gateway"}
+
 @app.post("/generate")
 async def generate_response(
     payload: PromptRequest,
@@ -135,6 +146,7 @@ async def generate_response(
     prompt_hash = hashlib.sha256(clean_prompt.strip().lower().encode("utf-8")).hexdigest()
     cache_key = f"cache:{prompt_hash}"
 
+    # Check Cache First
     if redis_client:
         try:
             cached_response = redis_client.get(cache_key)
@@ -147,6 +159,7 @@ async def generate_response(
         except redis.RedisError as e:
             logging.error(f"Redis fetch error: {e}")
 
+    # Primary Attempt with Automatic Fallback Rerouting
     logging.info("🟢 Attempting primary model (Groq)...")
     try:
         response_text = call_groq_primary(clean_prompt)
@@ -163,6 +176,7 @@ async def generate_response(
                 detail=f"Bad Gateway: Primary and Fallback providers failed. Details: {fallback_error}"
             )
 
+    # Store in Cache
     if redis_client:
         try:
             redis_client.setex(cache_key, 3600, response_text)
