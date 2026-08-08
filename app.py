@@ -24,15 +24,13 @@ app = FastAPI(
     version="1.2.0"
 )
 
-# Environment Variables
 X_API_KEY = os.getenv("X_API_KEY", "secret-internal-key-123")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-# Client Initialization
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and GROQ_API_KEY != "gsk_INVALID_KEY_FOR_TESTING" else None
 
 try:
     redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
@@ -42,12 +40,11 @@ except Exception as e:
     logging.warning(f"Redis connection failed: {e}. Operating without cache/rate limiting.")
     redis_client = None
 
-# Request Data Models
 class PromptRequest(BaseModel):
     prompt: str
 
 # ------------------------------------------------------------------------------
-# 2. PII Sanitization Guardrail
+# 2. PII Guardrail & Security
 # ------------------------------------------------------------------------------
 def sanitize_prompt(prompt: str) -> tuple[str, bool]:
     pii_patterns = {
@@ -66,9 +63,6 @@ def sanitize_prompt(prompt: str) -> tuple[str, bool]:
 
     return cleaned_prompt, pii_detected
 
-# ------------------------------------------------------------------------------
-# 3. Security & Rate Limiting Helpers
-# ------------------------------------------------------------------------------
 def verify_api_key(x_api_key: Optional[str] = Header(None)):
     if not x_api_key or x_api_key != X_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid or missing X-API-Key header.")
@@ -92,12 +86,12 @@ def enforce_rate_limit(api_key: str, max_requests: int = 10, window_seconds: int
         logging.error(f"Redis rate limiting error: {e}")
 
 # ------------------------------------------------------------------------------
-# 4. LLM Provider Execution Callables
+# 3. Execution Engines (Real API Calls)
 # ------------------------------------------------------------------------------
 def call_groq_primary(prompt: str) -> str:
     """Calls primary model: Groq (Llama 3.3 70B)."""
     if not groq_client:
-        raise Exception("Groq API client is not configured or key is invalid.")
+        raise Exception("Groq client not initialized or invalid key provided.")
     completion = groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
         model="llama-3.3-70b-versatile"
@@ -105,9 +99,9 @@ def call_groq_primary(prompt: str) -> str:
     return completion.choices[0].message.content
 
 def call_huggingface_fallback(prompt: str) -> str:
-    """Calls secondary fallback: Hugging Face Serverless Router (Qwen2.5-Coder)."""
+    """Calls live secondary model fallback on Hugging Face Serverless API."""
     if not HF_TOKEN:
-        raise Exception("Hugging Face API token is missing.")
+        raise Exception("Hugging Face API token (HF_TOKEN) is missing.")
     
     url = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-Coder-32B-Instruct"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
@@ -126,7 +120,7 @@ def call_huggingface_fallback(prompt: str) -> str:
     return str(res_data)
 
 # ------------------------------------------------------------------------------
-# 5. Core REST Endpoint: /generate
+# 4. REST Endpoints
 # ------------------------------------------------------------------------------
 @app.post("/generate")
 async def generate_response(
@@ -153,7 +147,6 @@ async def generate_response(
         except redis.RedisError as e:
             logging.error(f"Redis fetch error: {e}")
 
-    # Primary Attempt with Automatic Fallback
     logging.info("🟢 Attempting primary model (Groq)...")
     try:
         response_text = call_groq_primary(clean_prompt)
