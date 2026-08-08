@@ -32,7 +32,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
 # Client Initialization
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and GROQ_API_KEY != "gsk_INVALID_KEY_FOR_TESTING" else None
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and not GROQ_API_KEY.startswith("invalid_") and not GROQ_API_KEY.startswith("invlaid_") else None
 
 try:
     redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
@@ -104,17 +104,17 @@ def call_groq_primary(prompt: str) -> str:
     return completion.choices[0].message.content
 
 def call_huggingface_fallback(prompt: str) -> str:
-    """Secondary LLM provider fallback: Hugging Face Router API (Qwen 2.5 Coder)."""
+    """Secondary LLM provider fallback: Hugging Face Router API (Llama 3.2 1B)."""
     if not HF_TOKEN:
         raise Exception("Hugging Face API token (HF_TOKEN) is missing.")
     
     url = "https://router.huggingface.co/hf-inference/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
+        "Authorization": f"Bearer {HF_TOKEN.strip()}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "model": "meta-llama/Llama-3.2-1B-Instruct",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 256
     }
@@ -160,17 +160,17 @@ async def generate_response(
             logging.error(f"Redis fetch error: {e}")
 
     # Primary Attempt with Automatic Fallback Rerouting
-    logging.info("🟢 Attempting primary model (Groq)...")
+    logging.info("Attempting primary model (Groq)...")
     try:
         response_text = call_groq_primary(clean_prompt)
         source = "primary_groq"
     except Exception as primary_error:
-        logging.warning(f"🟡 Primary Groq failed: {primary_error}. Rerouting to Hugging Face fallback...")
+        logging.warning(f"Primary Groq failed: {primary_error}. Rerouting to Hugging Face fallback...")
         try:
             response_text = call_huggingface_fallback(clean_prompt)
             source = "fallback_huggingface"
         except Exception as fallback_error:
-            logging.error(f"❌ Fallback failed: {fallback_error}")
+            logging.error(f"Fallback failed: {fallback_error}")
             raise HTTPException(
                 status_code=502,
                 detail=f"Bad Gateway: Primary and Fallback providers failed. Details: {fallback_error}"
