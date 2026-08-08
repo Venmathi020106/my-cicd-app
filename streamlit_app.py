@@ -30,6 +30,7 @@ if prompt:
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             if response.status_code == 200:
                 data = response.json()
+                # Correct key extraction from FastAPI payload
                 text = data.get("response", "No response received.")
                 source = data.get("source", "unknown")
                 
