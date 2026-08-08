@@ -1,27 +1,31 @@
+version: '3.8'
+
 services:
+  redis:
+    image: redis:alpine
+    container_name: ${COMPOSE_PROJECT_NAME}-redis
+    restart: always
+
   web:
     build: .
+    container_name: ${COMPOSE_PROJECT_NAME}-web
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    environment:
+      - X_API_KEY=${X_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
     ports:
-      - "8000:8000"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    env_file:
-      - .env
+      - "${WEB_PORT}:8000"
     depends_on:
       - redis
 
-  redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
-
   ui:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
+    container_name: ${COMPOSE_PROJECT_NAME}-ui
     command: streamlit run streamlit_app.py --server.port=8501 --server.address=0.0.0.0
     ports:
-      - "8501:8501"
+      - "${UI_PORT}:8501"
     depends_on:
       - web
