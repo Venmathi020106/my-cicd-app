@@ -150,7 +150,7 @@ async def generate_response(
     if redis_client:
         try:
             cached_response = redis_client.get(cache_key)
-            if cached_response:
+            if cached_response and cached_response.decode("utf-8").strip():
                 return {
                     "response": cached_response.decode("utf-8"),
                     "source": "redis_cache",
@@ -176,8 +176,8 @@ async def generate_response(
                 detail=f"Bad Gateway: Primary and Fallback providers failed. Details: {fallback_error}"
             )
 
-    # Store in Cache
-    if redis_client:
+    # Store in Cache only if non-empty
+    if redis_client and response_text and response_text.strip():
         try:
             redis_client.setex(cache_key, 3600, response_text)
         except redis.RedisError as e:
