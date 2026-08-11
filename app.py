@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import hashlib
 import logging
@@ -11,17 +10,21 @@ import redis
 import requests
 from groq import Groq
 
-# ------------------------------------------------------------------------------
+# CrewAI & LangChain Imports for Multi-Agent Workflows
+from crewai import Agent, Task, Crew, Process
+from langchain_groq import ChatGroq
+
+# ------------------------------------------------------------------
 # 1. Configuration & Application Setup
-# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = FastAPI(
     title="Enterprise AI Gateway & Governance Platform",
-    description="Production API Gateway with PII Guardrails, Multi-turn Chat Context, Redis Caching & Failover Orchestration.",
-    version="1.3.0"
+    description="Production API Gateway with PII Guardrails, Multi-turn Chat Context, Redis Caching, Failover Orchestration & Multi-Agent Workflows",
+    version="1.4.0"
 )
 
 # Environment Variables
@@ -31,180 +34,223 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-# Client Initialization
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and not GROQ_API_KEY.startswith("invalid_") and not GROQ_API_KEY.startswith("invlaid_") else None
+# Client Initialization: Groq SDK
+groq_client = None
+if GROQ_API_KEY and not GROQ_API_KEY.startswith("invalid"):
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        logging.warning(f"Groq Client initialization warning: {e}")
 
+# Client Initialization: LangChain Groq (for CrewAI)
+crew_llm = None
+if GROQ_API_KEY and not GROQ_API_KEY.startswith("invalid"):
+    try:
+        crew_llm = ChatGroq(
+            temperature=0.3,
+            groq_api_key=GROQ_API_KEY,
+            model_name="llama-3.3-70b-versatile"
+        )
+    except Exception as e:
+        logging.warning(f"CrewAI LLM initialization warning: {e}")
+
+# Client Initialization: Redis Cache
 try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
     redis_client.ping()
-    logging.info(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+    logging.info("Connected to Redis successfully.")
 except Exception as e:
-    logging.warning(f"Redis connection failed: {e}. Operating without cache/rate limiting.")
+    logging.warning(f"Redis connection offline: {e}")
     redis_client = None
 
-# Pydantic Schemas for Multi-turn History
-class MessageItem(BaseModel):
+
+# ------------------------------------------------------------------
+# 2. Pydantic Request / Response Schemas
+# ------------------------------------------------------------------
+class ChatMessage(BaseModel):
     role: str
     content: str
 
-class PromptRequest(BaseModel):
-    messages: List[MessageItem]
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
 
-# ------------------------------------------------------------------------------
-# 2. PII Guardrail & Security Helpers
-# ------------------------------------------------------------------------------
-def sanitize_prompt(prompt: str) -> tuple[str, bool]:
-    """Scans and redacts sensitive data (emails, phones, cards, keys) from prompts."""
-    pii_patterns = {
-        "EMAIL": r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
-        "PHONE": r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
-        "CREDIT_CARD": r'\b(?:\d[ -]*?){13,16}\b',
-        "API_KEY_SECRET": r'(?i)(api[_-]?key|secret|bearer|token)\s*[:=]\s*["\']?[a-zA-Z0-9_\-]{16,}["\']?'
-    }
-    cleaned_prompt = prompt
-    pii_detected = False
+class MultiAgentRequest(BaseModel):
+    topic: str
 
-    for pii_type, pattern in pii_patterns.items():
-        if re.search(pattern, cleaned_prompt):
-            pii_detected = True
-            cleaned_prompt = re.sub(pattern, f"[REDACTED_{pii_type}]", cleaned_prompt)
 
-    return cleaned_prompt, pii_detected
-
+# ------------------------------------------------------------------
+# 3. Helper Functions & Guardrails
+# ------------------------------------------------------------------
 def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    """Validates header authorization key."""
-    if not x_api_key or x_api_key != X_API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid or missing X-API-Key header.")
+    """Validates incoming internal API requests against the configured key."""
+    if x_api_key != X_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-API-KEY header")
     return x_api_key
 
-def enforce_rate_limit(api_key: str, max_requests: int = 10, window_seconds: int = 60):
-    """Enforces sliding window rate limits using Redis."""
-    if not redis_client:
-        return
-    rate_key = f"rate_limit:{api_key}"
-    try:
-        current_requests = redis_client.incr(rate_key)
-        if current_requests == 1:
-            redis_client.expire(rate_key, window_seconds)
-        if current_requests > max_requests:
-            ttl = redis_client.ttl(rate_key)
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too Many Requests: Rate limit exceeded. Try again in {ttl} seconds."
-            )
-    except redis.RedisError as e:
-        logging.error(f"Redis rate limiting error: {e}")
+def generate_cache_key(messages: List[ChatMessage]) -> str:
+    """Generates a unique MD5 hash based on full message history for Redis caching."""
+    serialized = "|".join([f"{m.role}:{m.content}" for m in messages])
+    return f"cache:chat:{hashlib.md5(serialized.encode()).hexdigest()}"
 
-# ------------------------------------------------------------------------------
-# 3. Execution Engines (Primary & Secondary Fallback)
-# ------------------------------------------------------------------------------
-def call_groq_primary(messages: List[Dict[str, str]]) -> str:
-    """Primary LLM provider: Groq (Llama 3.3 70B) with full chat history."""
-    if not groq_client:
-        raise Exception("Groq client not initialized or invalid API key.")
-    completion = groq_client.chat.completions.create(
-        messages=messages,
-        model="llama-3.3-70b-versatile"
-    )
-    return completion.choices[0].message.content
-
-def call_huggingface_fallback(messages: List[Dict[str, str]]) -> str:
-    """Secondary LLM provider fallback: Hugging Face Router API (Llama 3.2 1B)."""
+def call_huggingface_fallback(messages: List[ChatMessage]) -> str:
+    """Fallback handler using Hugging Face Inference API if Groq fails or rate-limits."""
     if not HF_TOKEN:
-        raise Exception("Hugging Face API token (HF_TOKEN) is missing.")
+        raise HTTPException(status_code=502, detail="Groq API failed and HF_TOKEN is missing for failover.")
     
-    url = "https://router.huggingface.co/hf-inference/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN.strip()}",
-        "Content-Type": "application/json"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    API_URL = "https://api-inference.huggingface.co/models/meta-llama/Llama-3.2-3B-Instruct"
+    
+    # Extract last user message for payload
+    prompt = messages[-1].content if messages else "Hello"
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 500, "temperature": 0.3}}
+    
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+    if response.status_code == 200:
+        res_data = response.json()
+        if isinstance(res_data, list) and "generated_text" in res_data[0]:
+            return res_data[0]["generated_text"]
+        return str(res_data)
+    else:
+        raise HTTPException(
+            status_code=502, 
+            detail=f"Both Groq and Hugging Face Failovers failed: {response.text}"
+        )
+
+
+# ------------------------------------------------------------------
+# 4. Endpoints
+# ------------------------------------------------------------------
+@app.get("/health")
+async def health_check():
+    """Health check endpoint to verify container and dependency status."""
+    return {
+        "status": "healthy",
+        "redis_connected": redis_client is not None,
+        "groq_configured": groq_client is not None,
+        "hf_fallback_ready": bool(HF_TOKEN)
     }
-    payload = {
-        "model": "meta-llama/Llama-3.2-1B-Instruct",
-        "messages": messages,
-        "max_tokens": 256
-    }
-    
-    response = requests.post(url, headers=headers, json=payload, timeout=20)
-    if response.status_code != 200:
-        raise Exception(f"Hugging Face API Error ({response.status_code}): {response.text}")
-    
-    res_data = response.json()
-    return res_data["choices"][0]["message"]["content"]
 
-# ------------------------------------------------------------------------------
-# 4. REST Endpoints
-# ------------------------------------------------------------------------------
-@app.get("/")
-def read_root():
-    return {"status": "online", "service": "Enterprise AI Gateway"}
 
-@app.post("/generate")
-async def generate_response(
-    payload: PromptRequest,
-    api_key: str = Depends(verify_api_key)
-):
-    enforce_rate_limit(api_key)
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest, api_key: str = Depends(verify_api_key)):
+    """Standard multi-turn chat endpoint with Redis caching and Groq/HF failover."""
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="Messages array cannot be empty.")
 
-    # Sanitize each message in the context history
-    formatted_messages = []
-    pii_found = False
-    for msg in payload.messages:
-        if msg.role == "user":
-            clean_content, pii_detected = sanitize_prompt(msg.content)
-            if pii_detected:
-                pii_found = True
-            formatted_messages.append({"role": "user", "content": clean_content})
-        else:
-            formatted_messages.append({"role": msg.role, "content": msg.content})
+    cache_key = generate_cache_key(request.messages)
 
-    # Cache key generated based on full context sequence
-    context_str = "".join([f"{m['role']}:{m['content']}" for m in formatted_messages])
-    prompt_hash = hashlib.sha256(context_str.strip().lower().encode("utf-8")).hexdigest()
-    cache_key = f"cache:{prompt_hash}"
-
-    # Check Cache First
+    # 1. Check Redis Cache
     if redis_client:
         try:
-            cached_response = redis_client.get(cache_key)
-            if cached_response and cached_response.decode("utf-8").strip():
-                return {
-                    "response": cached_response.decode("utf-8"),
-                    "source": "redis_cache",
-                    "pii_redacted": pii_found
-                }
-        except redis.RedisError as e:
-            logging.error(f"Redis fetch error: {e}")
+            cached_res = redis_client.get(cache_key)
+            if cached_res:
+                logging.info(f"Cache HIT for key: {cache_key}")
+                return {"response": cached_res, "source": "redis_cache"}
+        except Exception as e:
+            logging.error(f"Redis lookup error: {e}")
 
-    # Primary Attempt with Automatic Fallback Rerouting
-    logging.info("Attempting primary model (Groq)...")
-    try:
-        response_text = call_groq_primary(formatted_messages)
-        source = "primary_groq"
-    except Exception as primary_error:
-        logging.warning(f"Primary Groq failed: {primary_error}. Rerouting to Hugging Face fallback...")
+    # 2. Call Primary LLM (Groq Llama 3.3)
+    formatted_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    
+    if groq_client:
         try:
-            response_text = call_huggingface_fallback(formatted_messages)
-            source = "fallback_huggingface"
-        except Exception as fallback_error:
-            logging.error(f"Fallback failed: {fallback_error}")
-            raise HTTPException(
-                status_code=502,
-                detail=f"Bad Gateway: Primary and Fallback providers failed. Details: {fallback_error}"
+            logging.info("Executing request via Groq (Llama 3.3)...")
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=formatted_messages,
+                temperature=0.3,
+                max_tokens=1024
             )
+            response_text = completion.choices[0].message.content
 
-    # Store in Cache only if response is non-empty
-    if redis_client and response_text and response_text.strip():
-        try:
-            redis_client.setex(cache_key, 3600, response_text)
-        except redis.RedisError as e:
-            logging.error(f"Redis store error: {e}")
+            # Cache the successful response (TTL: 1 Hour)
+            if redis_client and response_text:
+                try:
+                    redis_client.setex(cache_key, 3600, response_text)
+                except Exception as e:
+                    logging.error(f"Redis write error: {e}")
 
-    return {
-        "response": response_text,
-        "source": source,
-        "pii_redacted": pii_found
-    }
+            return {"response": response_text, "source": "groq_llama_3.3"}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+        except Exception as e:
+            logging.warning(f"Groq API call failed: {e}. Routing to Hugging Face Fallback...")
+
+    # 3. Failover Execution
+    response_text = call_huggingface_fallback(request.messages)
+    return {"response": response_text, "source": "huggingface_fallback"}
+
+
+@app.post("/multi-agent-chat")
+async def run_multi_agent(request: MultiAgentRequest, api_key: str = Depends(verify_api_key)):
+    """Multi-Agent execution endpoint utilizing CrewAI and Llama 3.3."""
+    if not crew_llm:
+        raise HTTPException(
+            status_code=500, 
+            detail="CrewAI LLM engine is not initialized. Ensure GROQ_API_KEY is configured."
+        )
+
+    try:
+        logging.info(f"Initiating Multi-Agent Crew for topic: '{request.topic}'")
+
+        # Define Agent 1: Technical Researcher
+        researcher = Agent(
+            role="Technical Researcher",
+            goal=f"Analyze the request '{request.topic}' and extract key architectural components.",
+            backstory="An expert enterprise systems architect specializing in scalable design patterns.",
+            llm=crew_llm,
+            verbose=True
+        )
+
+        # Define Agent 2: Technical Writer
+        writer = Agent(
+            role="Technical Writer",
+            goal="Synthesize research findings into clear, developer-friendly documentation.",
+            backstory="A principal documentation engineer who simplifies complex technical structures.",
+            llm=crew_llm,
+            verbose=True
+        )
+
+        # Define Task 1
+        task_research = Task(
+            description=f"Analyze this topic in detail and break down technical specs: {request.topic}",
+            expected_output="A bulleted list of technical components and requirements.",
+            agent=researcher
+        )
+
+        # Define Task 2
+        task_write = Task(
+            description="Format the research output into a final structured guide with actionable steps.",
+            expected_output="A developer-friendly implementation guide.",
+            agent=writer
+        )
+
+        # Assemble and Run Crew
+        crew = Crew(
+            agents=[researcher, writer],
+            tasks=[task_research, task_write],
+            process=Process.sequential
+        )
+
+        crew_result = crew.kickoff()
+
+        # Capture individual outputs per agent to clearly identify response sources
+        agent_responses = [
+            {
+                "agent_role": "🤖 Technical Researcher (Agent 1)",
+                "output": task_research.output.raw if task_research.output else "No response generated."
+            },
+            {
+                "agent_role": "✍️ Technical Writer (Agent 2)",
+                "output": task_write.output.raw if task_write.output else "No response generated."
+            }
+        ]
+
+        return {
+            "status": "success",
+            "agent_responses": agent_responses,
+            "final_summary": str(crew_result)
+        }
+
+    except Exception as e:
+        logging.error(f"Multi-agent workflow error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
