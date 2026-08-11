@@ -1,67 +1,70 @@
-import streamlit as st
+import os
 import requests
+import streamlit as st
 
-st.set_page_config(page_title="Enterprise LLM Chat", layout="centered")
+# Environment Configurations
+FASTAPI_URL = os.getenv("FASTAPI_URL", "http://localhost:8000/multi-agent-chat")
+X_API_KEY = os.getenv("X_API_KEY", "secret-internal-key-123")
 
-st.title("🤖 Enterprise LLM Chat")
-st.caption("Powered by FastAPI, Groq & Redis Caching (Secured with API Key)")
+st.set_page_config(page_title="Enterprise Multi-Agent Workspace", page_icon="🤖", layout="wide")
 
-# Model Selector
-selected_model = st.selectbox("Select Model:", ["llama-3.3-70b-versatile"])
+st.title("🤖 Multi-Agent Llama 3.3 Enterprise Gateway")
+st.caption("Orchestrating Autonomous AI Agents via Groq, CrewAI, and FastAPI")
 
-# 1. Initialize persistent state
+# Initialize Session State for Chat History
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# 2. Render past messages
-chat_container = st.container()
-with chat_container:
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-            if "source" in message:
-                st.caption(f"⚡ Served via: `{message['source']}`")
+# Display Past Chat Messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        if "agent_responses" in message:
+            for resp in message["agent_responses"]:
+                st.markdown(f"### {resp['agent_role']}")
+                st.markdown(resp["output"])
+                st.divider()
+        else:
+            st.markdown(message["content"])
 
-# 3. Handle user input
-if prompt := st.chat_input("Ask anything..."):
-    # Append user prompt
+# Process User Input
+if prompt := st.chat_input("Enter a technical topic or request for the agent crew..."):
+    # Render user prompt in UI
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with chat_container:
-        with st.chat_message("user"):
-            st.write(prompt)
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-    # Format full message history payload for backend
-    api_messages = [
-        {"role": msg["role"], "content": msg["content"]} 
-        for msg in st.session_state.messages
-    ]
-
-    url = "http://web:8000/generate"
-    headers = {
-        "X-API-Key": "secret-internal-key-123",
-        "Content-Type": "application/json"
-    }
-    payload = {"messages": api_messages}
-
-    with chat_container:
-        with st.chat_message("assistant"):
+    # Call FastAPI Multi-Agent Endpoint
+    with st.chat_message("assistant"):
+        with st.spinner("🤖 Agent Team Collaborating (Technical Researcher ➔ Technical Writer)..."):
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                headers = {"X-API-KEY": X_API_KEY}
+                payload = {"topic": prompt}
+
+                response = requests.post(
+                    FASTAPI_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=120
+                )
+
                 if response.status_code == 200:
                     data = response.json()
-                    text = data.get("response", "No response received.")
-                    source = data.get("source", "unknown")
-                    
-                    st.write(text)
-                    st.caption(f"⚡ Served via: `{source}`")
-                    
-                    # Save assistant response to context
+                    agent_responses = data.get("agent_responses", [])
+
+                    # Render each individual agent output explicitly
+                    for resp in agent_responses:
+                        st.markdown(f"### {resp['agent_role']}")
+                        st.markdown(resp["output"])
+                        st.divider()
+
+                    # Save complete response array to session state
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": text,
-                        "source": source
+                        "content": data.get("final_summary", ""),
+                        "agent_responses": agent_responses
                     })
                 else:
-                    st.error(f"API Error: {response.status_code} - {response.text}")
+                    st.error(f"Backend API Error ({response.status_code}): {response.text}")
+
             except Exception as e:
-                st.error(f"Failed to connect to backend: {e}")
+                st.error(f"Connection Error: {str(e)}")
