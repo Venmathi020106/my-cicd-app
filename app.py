@@ -100,7 +100,6 @@ def call_huggingface_fallback(messages: List[ChatMessage]) -> str:
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     API_URL = "https://api-inference.huggingface.co/models/meta-llama/Llama-3.2-3B-Instruct"
     
-    # Extract last user message for payload
     prompt = messages[-1].content if messages else "Hello"
     payload = {"inputs": prompt, "parameters": {"max_new_tokens": 500, "temperature": 0.3}}
     
@@ -139,7 +138,6 @@ async def chat_endpoint(request: ChatRequest, api_key: str = Depends(verify_api_
 
     cache_key = generate_cache_key(request.messages)
 
-    # 1. Check Redis Cache
     if redis_client:
         try:
             cached_res = redis_client.get(cache_key)
@@ -149,7 +147,6 @@ async def chat_endpoint(request: ChatRequest, api_key: str = Depends(verify_api_
         except Exception as e:
             logging.error(f"Redis lookup error: {e}")
 
-    # 2. Call Primary LLM (Groq Llama 3.3)
     formatted_messages = [{"role": m.role, "content": m.content} for m in request.messages]
     
     if groq_client:
@@ -163,7 +160,6 @@ async def chat_endpoint(request: ChatRequest, api_key: str = Depends(verify_api_
             )
             response_text = completion.choices[0].message.content
 
-            # Cache the successful response (TTL: 1 Hour)
             if redis_client and response_text:
                 try:
                     redis_client.setex(cache_key, 3600, response_text)
@@ -175,14 +171,13 @@ async def chat_endpoint(request: ChatRequest, api_key: str = Depends(verify_api_
         except Exception as e:
             logging.warning(f"Groq API call failed: {e}. Routing to Hugging Face Fallback...")
 
-    # 3. Failover Execution
     response_text = call_huggingface_fallback(request.messages)
     return {"response": response_text, "source": "huggingface_fallback"}
 
 
 @app.post("/multi-agent-chat")
 async def run_multi_agent(request: MultiAgentRequest, api_key: str = Depends(verify_api_key)):
-    """Multi-Agent execution endpoint utilizing CrewAI and Llama 3.3."""
+    """Multi-Agent execution endpoint returning explicit outputs per agent."""
     if not crew_llm:
         raise HTTPException(
             status_code=500, 
@@ -210,14 +205,14 @@ async def run_multi_agent(request: MultiAgentRequest, api_key: str = Depends(ver
             verbose=True
         )
 
-        # Define Task 1
+        # Define Task 1 for Technical Researcher
         task_research = Task(
             description=f"Analyze this topic in detail and break down technical specs: {request.topic}",
             expected_output="A bulleted list of technical components and requirements.",
             agent=researcher
         )
 
-        # Define Task 2
+        # Define Task 2 for Technical Writer
         task_write = Task(
             description="Format the research output into a final structured guide with actionable steps.",
             expected_output="A developer-friendly implementation guide.",
@@ -233,22 +228,34 @@ async def run_multi_agent(request: MultiAgentRequest, api_key: str = Depends(ver
 
         crew_result = crew.kickoff()
 
-        # Capture individual outputs per agent to clearly identify response sources
-        agent_responses = [
-            {
-                "agent_role": "🤖 Technical Researcher (Agent 1)",
-                "output": task_research.output.raw if task_research.output else "No response generated."
-            },
-            {
-                "agent_role": "✍️ Technical Writer (Agent 2)",
-                "output": task_write.output.raw if task_write.output else "No response generated."
-            }
-        ]
+        # Extract outputs per agent directly from Task objects and CrewOutput tasks_output
+        agent_responses = []
+
+        if hasattr(crew_result, 'tasks_output') and crew_result.tasks_output:
+            for task_out in crew_result.tasks_output:
+                agent_name = task_out.agent if hasattr(task_out, 'agent') and task_out.agent else "AI Agent"
+                agent_responses.append({
+                    "agent_role": f"🤖 {agent_name}",
+                    "output": str(task_out.raw)
+                })
+
+        # Fallback mapping if tasks_output is unavailable
+        if not agent_responses:
+            agent_responses = [
+                {
+                    "agent_role": "🤖 Technical Researcher (Agent 1)",
+                    "output": str(task_research.output.raw) if task_research.output else "No output"
+                },
+                {
+                    "agent_role": "✍️ Technical Writer (Agent 2)",
+                    "output": str(task_write.output.raw) if task_write.output else "No output"
+                }
+            ]
 
         return {
             "status": "success",
             "agent_responses": agent_responses,
-            "final_summary": str(crew_result)
+            "final_summary": str(crew_result.raw) if hasattr(crew_result, 'raw') else str(crew_result)
         }
 
     except Exception as e:
