@@ -3,7 +3,7 @@ import requests
 import streamlit as st
 
 # Environment Configurations
-FASTAPI_URL = os.getenv("FASTAPI_URL", "http://localhost:8000/multi-agent-chat")
+FASTAPI_URL = os.getenv("FASTAPI_URL", "http://app-web:8000/multi-agent-chat")
 X_API_KEY = os.getenv("X_API_KEY", "secret-internal-key-123")
 
 st.set_page_config(page_title="Enterprise Multi-Agent Workspace", page_icon="🤖", layout="wide")
